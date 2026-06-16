@@ -2,7 +2,8 @@
 import json, smtplib, os, sys, time, re, urllib.parse, xml.etree.ElementTree as ET
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
 KST = ZoneInfo("Asia/Seoul")
@@ -64,6 +65,32 @@ def translate_ko(text):
     except:
         return ''
 
+def fmt_news_date(dt):
+    """datetime을 한국시간 'MM.DD' 형식으로 변환"""
+    try:
+        return dt.astimezone(KST).strftime('%m.%d')
+    except:
+        return ''
+
+def select_recent(items, count=3, days=14):
+    """뉴스를 최신순 정렬. 최근 days일 이내를 우선하고, 부족하면 그 이전 것으로 채운다.
+    각 item에는 정렬용 '_dt'(datetime 또는 None)가 들어 있어야 한다."""
+    now = datetime.now(timezone.utc)
+    def key(it):
+        dt = it.get('_dt')
+        # 날짜 없는 항목은 맨 뒤로
+        return dt if dt else datetime.min.replace(tzinfo=timezone.utc)
+    dated   = [it for it in items if it.get('_dt')]
+    undated = [it for it in items if not it.get('_dt')]
+    dated.sort(key=key, reverse=True)
+    recent = [it for it in dated if (now - it['_dt']).days < days]
+    older  = [it for it in dated if (now - it['_dt']).days >= days]
+    ordered = recent + older + undated   # 최근 → 오래된 → 날짜미상
+    picked = ordered[:count]
+    for it in picked:
+        it.pop('_dt', None)
+    return picked
+
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 # ── 주가 데이터 ──────────────────────────────────────────────
@@ -96,15 +123,23 @@ def get_korean_news_rss(query, count=3):
         r = requests.get(url, headers=HEADERS, timeout=10)
         root = ET.fromstring(r.content)
         news = []
-        for item in root.findall('.//item')[:count]:
+        for item in root.findall('.//item'):   # 전체 수집 후 최신순 선택
             title = item.findtext('title', '').strip()
             link  = item.findtext('link', '').strip()
+            dt = None
+            pd = item.findtext('pubDate', '')
+            if pd:
+                try:
+                    dt = parsedate_to_datetime(pd)
+                except:
+                    pass
             source = ''
             if ' - ' in title:
                 title, source = title.rsplit(' - ', 1)
             if title:
-                news.append({'title': title, 'summary': '', 'link': link, 'publisher': source})
-        return news
+                news.append({'title': title, 'summary': '', 'link': link, 'publisher': source,
+                             'date': fmt_news_date(dt) if dt else '', '_dt': dt})
+        return select_recent(news, count)
     except:
         return []
 
@@ -114,7 +149,7 @@ def get_news(ticker, name='', count=3):
         stock = yf.Ticker(ticker)
         news_list = getattr(stock, 'news', None) or []
         result = []
-        for a in news_list[:count*2]:  # 여유있게 가져와서 필터
+        for a in news_list:  # 전체 수집 후 최신순 선택
             content = a.get('content', {}) or {}
             # 제목
             title = content.get('title') or a.get('title', '')
@@ -132,12 +167,21 @@ def get_news(ticker, name='', count=3):
             # 출처
             pub = ((content.get('provider') or {}).get('displayName') or
                    a.get('publisher', ''))
+            # 날짜
+            dt = None
+            try:
+                p = content.get('pubDate') or content.get('displayTime') or ''
+                if p:
+                    dt = datetime.fromisoformat(str(p).replace('Z', '+00:00'))
+                elif a.get('providerPublishTime'):
+                    dt = datetime.fromtimestamp(a['providerPublishTime'], tz=timezone.utc)
+            except:
+                pass
             if title:
-                result.append({'title': title, 'summary': summary, 'link': link, 'publisher': pub})
-            if len(result) >= count:
-                break
+                result.append({'title': title, 'summary': summary, 'link': link, 'publisher': pub,
+                               'date': fmt_news_date(dt) if dt else '', '_dt': dt})
         if result:
-            return result
+            return select_recent(result, count)
     except:
         pass
     # Yahoo 뉴스 없으면 Google News RSS 대체 (종목명 검색)
@@ -177,6 +221,9 @@ def news_html(news_list):
         summary = n.get('summary', '')
         link    = n.get('link', '')
         pub     = n.get('publisher', '')
+        date    = n.get('date', '')
+        date_html = (f"<span style='color:#a0aec0;font-size:11px;margin-left:6px'>({date})</span>"
+                     if date else "")
 
         # 영어 제목
         title_html = (f"<a href='{link}' style='color:#1a365d;text-decoration:none;font-weight:bold;font-size:13px'>{title}</a>"
@@ -201,7 +248,7 @@ def news_html(news_list):
 
         items += f"""
         <div style='margin-bottom:12px;padding-bottom:12px;border-bottom:1px dashed #e2e8f0'>
-          {title_html}
+          {title_html}{date_html}
           {title_ko_html}
           {summary_html}
           {summary_ko_html}
